@@ -466,4 +466,51 @@ mod tests {
 
         writer.close().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn albert_test() {
+        use std::sync::Arc;
+        use arrow::{array::{Int32Array, PrimitiveArray, RunArray, UInt32Array}, buffer::{MutableBuffer, RunEndBuffer, ScalarBuffer}, datatypes::UInt32Type};
+        use object_store::local::LocalFileSystem;
+        use crate::arrow::async_writer::ParquetObjectWriter;
+        
+        
+        let run_ends = Int32Array::from_iter_values([5]);
+        let all_nulls = UInt32Array::from_iter([None]);
+        let run_arr = RunArray::try_new(&run_ends, &all_nulls).unwrap();
+
+        let run_vals = run_arr.downcast::<UInt32Array>().unwrap();
+        for i in run_vals {
+            println!("{:?}", i);
+        }
+
+        let record_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::UInt32, true),
+                Field::new(
+                    "b",
+                    DataType::RunEndEncoded(
+                        Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                        Arc::new(Field::new("values", DataType::UInt32, true)),
+                    ),
+                    true,   
+                )
+            ])),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(vec![1, 2, 2, 3, 4])),
+                Arc::new(run_arr)
+            ]
+        ).unwrap();
+
+        let object_store = LocalFileSystem::new_with_prefix("/tmp").unwrap();
+        let object_writer = ParquetObjectWriter::new(Arc::new(object_store), "albert.parquet".into());
+        let mut arrow_writer = AsyncArrowWriter::try_new(
+            object_writer,
+            record_batch.schema(), 
+            Some(WriterProperties::default())
+        ).unwrap();
+
+        arrow_writer.write(&record_batch).await.unwrap();
+    }
+
 }

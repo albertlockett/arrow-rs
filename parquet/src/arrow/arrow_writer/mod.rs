@@ -1078,6 +1078,23 @@ impl ArrowColumnWriterFactory {
                     out.push(col(leaves.next().unwrap())?)
                 }
             }
+            ArrowDataType::RunEndEncoded(_, val_field) => match val_field.data_type() {
+                ArrowDataType::Utf8 | 
+                ArrowDataType::LargeUtf8 |
+                ArrowDataType::Binary |
+                ArrowDataType::LargeBinary |
+                ArrowDataType::Utf8View |
+                ArrowDataType::BinaryView |
+                ArrowDataType::FixedSizeBinary(_) => {
+                    out.push(bytes(leaves.next().unwrap())?)
+                }
+
+                // TODO do we gotta handle structs and stuff here?
+
+                _ => {
+                    out.push(col(leaves.next().unwrap())?)
+                }
+            }
             _ => return Err(ParquetError::NYI(
                 format!(
                     "Attempting to write an Arrow type {data_type:?} to parquet that is not yet implemented"
