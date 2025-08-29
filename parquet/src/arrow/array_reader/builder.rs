@@ -385,9 +385,6 @@ impl<'a> ArrayReaderBuilder<'a> {
                 Some(DataType::Utf8View | DataType::BinaryView) => {
                     make_byte_view_array_reader(page_iterator, column_desc, arrow_type)?
                 }
-                Some(DataType::RunEndEncoded(_, val)) => {
-                    make_byte_array_reader(page_iterator, column_desc, Some(val.data_type().clone()))?
-                }
                 _ => make_byte_array_reader(page_iterator, column_desc, arrow_type)?,
             },
             PhysicalType::FIXED_LEN_BYTE_ARRAY => match arrow_type {
