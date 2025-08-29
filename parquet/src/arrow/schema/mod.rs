@@ -775,7 +775,8 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
             arrow_to_parquet_type(&dict_field, coerce_types)
         }
         DataType::RunEndEncoded(_, ref vals_field) => {
-            arrow_to_parquet_type(vals_field.as_ref(), coerce_types)
+             let dict_field = field.clone().with_data_type(vals_field.data_type().clone());
+            arrow_to_parquet_type(&dict_field, coerce_types)
         }
     }
 }

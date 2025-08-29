@@ -90,6 +90,13 @@ fn apply_hint(parquet: DataType, hint: DataType) -> DataType {
         (DataType::Decimal128(_, _), DataType::Decimal64(_, _)) => hint,
         (DataType::Decimal128(_, _), DataType::Decimal256(_, _)) => hint,
 
+        (_, DataType::RunEndEncoded(_, value)) => {
+            let hinted = apply_hint(parquet, value.data_type().clone());
+            match &hinted == value.data_type() {
+                true => hint,
+                false => hinted,
+            }
+        },
         // Potentially preserve dictionary encoding
         (_, DataType::Dictionary(_, value)) => {
             // Apply hint to inner type
