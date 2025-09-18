@@ -24,11 +24,13 @@
 //!
 //! [`Seek`]: std::io::Seek
 
+use std::cell::RefCell;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::mem::size_of;
-use std::sync::Arc;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use flatbuffers::FlatBufferBuilder;
 
@@ -157,7 +159,7 @@ impl Default for IpcWriteOptions {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 /// Handles low level details of encoding [`Array`] and [`Schema`] into the
 /// [Arrow IPC Format].
 ///
@@ -189,9 +191,18 @@ impl Default for IpcWriteOptions {
 /// ```
 ///
 /// [Arrow IPC Format]: https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc
-pub struct IpcDataGenerator {}
+pub struct IpcDataGenerator<'a> {
+    /// TODO albert docts
+    pub compressor: Option<Arc<Mutex<zstd::bulk::Compressor<'a>>>>
+}
 
-impl IpcDataGenerator {
+impl<'a> std::fmt::Debug for IpcDataGenerator<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TODO")
+    }
+}
+
+impl<'a> IpcDataGenerator<'a> {
     /// Converts a schema to an IPC message along with `dictionary_tracker`
     /// and returns it encoded inside [EncodedData] as a flatbuffer.
     pub fn schema_to_bytes_with_dictionary_tracker(
@@ -487,6 +498,7 @@ impl IpcDataGenerator {
                 array.len(),
                 array.null_count(),
                 compression_codec,
+                self.compressor.clone(),
                 write_options,
             )?;
 
@@ -575,6 +587,7 @@ impl IpcDataGenerator {
             array_data.len(),
             array_data.null_count(),
             compression_codec,
+            self.compressor.clone(),
             write_options,
         )?;
 
@@ -987,7 +1000,7 @@ fn compare_dictionaries(old: &ArrayData, new: &ArrayData) -> DictionaryCompariso
 /// writer.finish().unwrap();
 /// ```
 /// [IPC File Format]: https://arrow.apache.org/docs/format/Columnar.html#ipc-file-format
-pub struct FileWriter<W> {
+pub struct FileWriter<'a, W> {
     /// The object to write to
     writer: W,
     /// IPC write options
@@ -1007,10 +1020,10 @@ pub struct FileWriter<W> {
     /// User level customized metadata
     custom_metadata: HashMap<String, String>,
 
-    data_gen: IpcDataGenerator,
+    data_gen: IpcDataGenerator<'a>,
 }
 
-impl<W: Write> FileWriter<BufWriter<W>> {
+impl<'a, W: Write> FileWriter<'a, BufWriter<W>> {
     /// Try to create a new file writer with the writer wrapped in a BufWriter.
     ///
     /// See [`FileWriter::try_new`] for an unbuffered version.
@@ -1019,7 +1032,7 @@ impl<W: Write> FileWriter<BufWriter<W>> {
     }
 }
 
-impl<W: Write> FileWriter<W> {
+impl<W: Write> FileWriter<'_, W> {
     /// Try to create a new writer, with the schema written as part of the header
     ///
     /// Note the created writer is not buffered. See [`FileWriter::try_new_buffered`] for details.
@@ -1199,7 +1212,7 @@ impl<W: Write> FileWriter<W> {
     }
 }
 
-impl<W: Write> RecordBatchWriter for FileWriter<W> {
+impl<W: Write> RecordBatchWriter for FileWriter<'_, W> {
     fn write(&mut self, batch: &RecordBatch) -> Result<(), ArrowError> {
         self.write(batch)
     }
@@ -1282,7 +1295,7 @@ impl<W: Write> RecordBatchWriter for FileWriter<W> {
 /// writer.finish().unwrap();
 /// ```
 /// [IPC Streaming Format]: https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format
-pub struct StreamWriter<W> {
+pub struct StreamWriter<'a, W> {
     /// The object to write to
     writer: W,
     /// IPC write options
@@ -1292,10 +1305,10 @@ pub struct StreamWriter<W> {
     /// Keeps track of dictionaries that have been written
     dictionary_tracker: DictionaryTracker,
 
-    data_gen: IpcDataGenerator,
+    data_gen: IpcDataGenerator<'a>,
 }
 
-impl<W: Write> StreamWriter<BufWriter<W>> {
+impl<W: Write> StreamWriter<'_, BufWriter<W>> {
     /// Try to create a new stream writer with the writer wrapped in a BufWriter.
     ///
     /// See [`StreamWriter::try_new`] for an unbuffered version.
@@ -1304,7 +1317,7 @@ impl<W: Write> StreamWriter<BufWriter<W>> {
     }
 }
 
-impl<W: Write> StreamWriter<W> {
+impl<W: Write> StreamWriter<'_, W> {
     /// Try to create a new writer, with the schema written as part of the header.
     ///
     /// Note that there is no internal buffering. See also [`StreamWriter::try_new_buffered`].
@@ -1327,7 +1340,9 @@ impl<W: Write> StreamWriter<W> {
         schema: &Schema,
         write_options: IpcWriteOptions,
     ) -> Result<Self, ArrowError> {
-        let data_gen = IpcDataGenerator::default();
+        let data_gen = IpcDataGenerator {
+            compressor: Some(Arc::new(Mutex::new(zstd::bulk::Compressor::new(zstd::DEFAULT_COMPRESSION_LEVEL).unwrap())))
+        };
         let mut dictionary_tracker = DictionaryTracker::new(false);
 
         // write the schema, set the written bytes to the schema
@@ -1448,7 +1463,7 @@ impl<W: Write> StreamWriter<W> {
     }
 }
 
-impl<W: Write> RecordBatchWriter for StreamWriter<W> {
+impl<W: Write> RecordBatchWriter for StreamWriter<'_, W> {
     fn write(&mut self, batch: &RecordBatch) -> Result<(), ArrowError> {
         self.write(batch)
     }
@@ -1667,6 +1682,7 @@ fn write_array_data(
     num_rows: usize,
     null_count: usize,
     compression_codec: Option<CompressionCodec>,
+    zstd_compressor: Option<Arc<Mutex<zstd::bulk::Compressor>>>,
     write_options: &IpcWriteOptions,
 ) -> Result<i64, ArrowError> {
     let mut offset = offset;
@@ -1696,6 +1712,7 @@ fn write_array_data(
             arrow_data,
             offset,
             compression_codec,
+            zstd_compressor.clone(),
             write_options.alignment,
         )?;
     }
@@ -1710,6 +1727,7 @@ fn write_array_data(
                 arrow_data,
                 offset,
                 compression_codec,
+                zstd_compressor.clone(),
                 write_options.alignment,
             )?;
         }
@@ -1727,6 +1745,7 @@ fn write_array_data(
                 arrow_data,
                 offset,
                 compression_codec,
+                zstd_compressor.clone(),
                 write_options.alignment,
             )?;
         }
@@ -1739,6 +1758,7 @@ fn write_array_data(
                 arrow_data,
                 offset,
                 compression_codec,
+                zstd_compressor.clone(),
                 write_options.alignment,
             )?;
         }
@@ -1771,6 +1791,7 @@ fn write_array_data(
             arrow_data,
             offset,
             compression_codec,
+            zstd_compressor.clone(),
             write_options.alignment,
         )?;
     } else if matches!(data_type, DataType::Boolean) {
@@ -1786,6 +1807,7 @@ fn write_array_data(
             arrow_data,
             offset,
             compression_codec,
+            zstd_compressor.clone(),
             write_options.alignment,
         )?;
     } else if matches!(
@@ -1808,6 +1830,7 @@ fn write_array_data(
             arrow_data,
             offset,
             compression_codec,
+            zstd_compressor.clone(),
             write_options.alignment,
         )?;
         offset = write_array_data(
@@ -1819,6 +1842,7 @@ fn write_array_data(
             sliced_child_data.len(),
             sliced_child_data.null_count(),
             compression_codec,
+            zstd_compressor.clone(),
             write_options,
         )?;
         return Ok(offset);
@@ -1839,6 +1863,7 @@ fn write_array_data(
             child_data.len(),
             child_data.null_count(),
             compression_codec,
+            zstd_compressor.clone(),
             write_options,
         )?;
         return Ok(offset);
@@ -1850,6 +1875,7 @@ fn write_array_data(
                 arrow_data,
                 offset,
                 compression_codec,
+                zstd_compressor.clone(),
                 write_options.alignment,
             )?;
         }
@@ -1872,6 +1898,7 @@ fn write_array_data(
                     data_ref.len(),
                     data_ref.null_count(),
                     compression_codec,
+                    zstd_compressor.clone(),
                     write_options,
                 )?;
             }
@@ -1889,6 +1916,7 @@ fn write_array_data(
                     data_ref.len(),
                     data_ref.null_count(),
                     compression_codec,
+                    zstd_compressor.clone(),
                     write_options,
                 )?;
             }
@@ -1915,10 +1943,11 @@ fn write_buffer(
     arrow_data: &mut Vec<u8>,         // output stream
     offset: i64,                      // current output stream offset
     compression_codec: Option<CompressionCodec>,
+    zstd_compressor: Option<Arc<Mutex<zstd::bulk::Compressor>>>,
     alignment: u8,
 ) -> Result<i64, ArrowError> {
     let len: i64 = match compression_codec {
-        Some(compressor) => compressor.compress_to_vec(buffer, arrow_data)?,
+        Some(compressor) => compressor.compress_to_vec(buffer, arrow_data, zstd_compressor)?,
         None => {
             arrow_data.extend_from_slice(buffer);
             buffer.len()
@@ -2250,7 +2279,7 @@ mod tests {
             false,
         )]));
 
-        let gen = IpcDataGenerator {};
+        let gen = IpcDataGenerator { compressor: None };
         let mut dict_tracker = DictionaryTracker::new(false);
         gen.schema_to_bytes_with_dictionary_tracker(
             &schema,
@@ -2293,7 +2322,7 @@ mod tests {
             false,
         )]));
 
-        let gen = IpcDataGenerator {};
+        let gen = IpcDataGenerator { compressor: None, };
         let mut dict_tracker = DictionaryTracker::new(false);
         gen.schema_to_bytes_with_dictionary_tracker(
             &schema,

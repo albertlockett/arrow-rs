@@ -2699,7 +2699,7 @@ mod tests {
         )])
         .unwrap();
 
-        let gen = IpcDataGenerator {};
+        let gen = IpcDataGenerator {compressor: None};
         let mut dict_tracker = DictionaryTracker::new(false);
         let (_, encoded) = gen
             .encoded_batch(&batch, &mut dict_tracker, &Default::default())
@@ -2737,7 +2737,7 @@ mod tests {
         )])
         .unwrap();
 
-        let gen = IpcDataGenerator {};
+        let gen = IpcDataGenerator { compressor: None };
         let mut dict_tracker = DictionaryTracker::new(false);
         let (_, encoded) = gen
             .encoded_batch(&batch, &mut dict_tracker, &Default::default())

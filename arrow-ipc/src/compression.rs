@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::{cell::RefCell, rc::Rc, sync::{Arc, Mutex}};
+
 use crate::CompressionType;
 use arrow_buffer::Buffer;
 use arrow_schema::ArrowError;
@@ -58,6 +60,7 @@ impl CompressionCodec {
         &self,
         input: &[u8],
         output: &mut Vec<u8>,
+        compressor: Option<Arc<Mutex<zstd::bulk::Compressor>>>,
     ) -> Result<usize, ArrowError> {
         let uncompressed_data_len = input.len();
         let original_output_len = output.len();
@@ -67,7 +70,7 @@ impl CompressionCodec {
         } else {
             // write compressed data directly into the output buffer
             output.extend_from_slice(&uncompressed_data_len.to_le_bytes());
-            self.compress(input, output)?;
+            self.compress(input, output, compressor)?;
 
             let compression_len = output.len() - original_output_len;
             if compression_len > uncompressed_data_len {
@@ -90,7 +93,10 @@ impl CompressionCodec {
     /// [8 bytes]:         uncompressed length
     /// [remaining bytes]: compressed data stream
     /// ```
-    pub(crate) fn decompress_to_buffer(&self, input: &Buffer) -> Result<Buffer, ArrowError> {
+    pub(crate) fn decompress_to_buffer(
+        &self, 
+        input: &Buffer,
+    ) -> Result<Buffer, ArrowError> {
         // read the first 8 bytes to determine if the data is
         // compressed
         let decompressed_length = read_uncompressed_size(input);
@@ -115,10 +121,14 @@ impl CompressionCodec {
 
     /// Compress the data in input buffer and write to output buffer
     /// using the specified compression
-    fn compress(&self, input: &[u8], output: &mut Vec<u8>) -> Result<(), ArrowError> {
+    fn compress(&self, input: &[u8], output: &mut Vec<u8>, compressor: Option<Arc<Mutex<zstd::bulk::Compressor>>>,) -> Result<(), ArrowError> {
         match self {
             CompressionCodec::Lz4Frame => compress_lz4(input, output),
-            CompressionCodec::Zstd => compress_zstd(input, output),
+            CompressionCodec::Zstd => {
+                let tmp1 = compressor.unwrap();
+                let mut tmp2 = tmp1.lock().unwrap();
+                compress_zstd(input, output, &mut &mut tmp2)
+            },
         }
     }
 
@@ -175,11 +185,12 @@ fn decompress_lz4(_input: &[u8], _decompressed_size: usize) -> Result<Vec<u8>, A
 }
 
 #[cfg(feature = "zstd")]
-fn compress_zstd(input: &[u8], output: &mut Vec<u8>) -> Result<(), ArrowError> {
-    use std::io::Write;
-    let mut encoder = zstd::Encoder::new(output, 0)?;
-    encoder.write_all(input)?;
-    encoder.finish()?;
+fn compress_zstd(input: &[u8], output: &mut Vec<u8>, compressor: &mut zstd::bulk::Compressor) -> Result<(), ArrowError> {
+    // let mut encoder = zstd::stream::read::Encoder::new(input, zstd::DEFAULT_COMPRESSION_LEVEL)?;
+    // _ = std::io::copy(&mut encoder, output)?;
+    let compressed = compressor.compress(&input)?;
+    output.extend_from_slice(&compressed);
+    // _ = compressor.compress_to_buffer(input, output)?;
     Ok(())
 }
 
@@ -227,7 +238,7 @@ mod tests {
         let input_bytes = b"hello lz4";
         let codec = super::CompressionCodec::Lz4Frame;
         let mut output_bytes: Vec<u8> = Vec::new();
-        codec.compress(input_bytes, &mut output_bytes).unwrap();
+        codec.compress(input_bytes, &mut output_bytes, None).unwrap();
         let result = codec
             .decompress(output_bytes.as_slice(), input_bytes.len())
             .unwrap();
@@ -237,10 +248,13 @@ mod tests {
     #[test]
     #[cfg(feature = "zstd")]
     fn test_zstd_compression() {
+        use std::{cell::RefCell, rc::Rc, sync::{Arc, Mutex}};
+
         let input_bytes = b"hello zstd";
+        let compressor = Some(Arc::new(Mutex::new(zstd::bulk::Compressor::new(zstd::DEFAULT_COMPRESSION_LEVEL).unwrap())));
         let codec = super::CompressionCodec::Zstd;
         let mut output_bytes: Vec<u8> = Vec::new();
-        codec.compress(input_bytes, &mut output_bytes).unwrap();
+        codec.compress(input_bytes, &mut output_bytes, compressor).unwrap();
         let result = codec
             .decompress(output_bytes.as_slice(), input_bytes.len())
             .unwrap();
