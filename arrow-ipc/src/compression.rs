@@ -29,7 +29,10 @@ const LENGTH_OF_PREFIX_DATA: i64 = 8;
 /// compression.
 pub struct CompressionContext {
     #[cfg(feature = "zstd")]
-    compressor: zstd::bulk::Compressor<'static>,
+    zstd_compressor: zstd::bulk::Compressor<'static>,
+
+    #[cfg(feature = "lz4")]
+    lz4_encoder: lz4_flex::frame::FrameEncoder<Vec<u8>>,
 }
 
 // the reason we allow derivable_impls here is because when zstd feature is not enabled, this
@@ -40,8 +43,13 @@ impl Default for CompressionContext {
         CompressionContext {
             // safety: `new` here will only return error here if using an invalid compression level
             #[cfg(feature = "zstd")]
-            compressor: zstd::bulk::Compressor::new(zstd::DEFAULT_COMPRESSION_LEVEL)
+            zstd_compressor: zstd::bulk::Compressor::new(zstd::DEFAULT_COMPRESSION_LEVEL)
                 .expect("can use default compression level"),
+
+            // note: this vec is a placeholder, we'll switch this with the output vec when calling
+            // [`compress_lz4`]
+            #[cfg(feature = "lz4")]
+            lz4_encoder: lz4_flex::frame::FrameEncoder::new(Vec::new()),
         }
     }
 }
@@ -119,7 +127,6 @@ impl CompressionCodec {
         Ok(output.len() - original_output_len)
     }
 
-    /// Decompresses the input into a [`Buffer`]
     ///
     /// The input should look like:
     /// ```text
@@ -158,7 +165,7 @@ impl CompressionCodec {
         context: &mut CompressionContext,
     ) -> Result<(), ArrowError> {
         match self {
-            CompressionCodec::Lz4Frame => compress_lz4(input, output),
+            CompressionCodec::Lz4Frame => compress_lz4(input, output, context),
             CompressionCodec::Zstd => compress_zstd(input, output, context),
         }
     }
@@ -181,19 +188,38 @@ impl CompressionCodec {
 }
 
 #[cfg(feature = "lz4")]
-fn compress_lz4(input: &[u8], output: &mut Vec<u8>) -> Result<(), ArrowError> {
+fn compress_lz4(
+    input: &[u8],
+    output: &mut Vec<u8>,
+    context: &mut CompressionContext,
+) -> Result<(), ArrowError> {
+    // let encoder_writer = context.lz4_encoder.get_mut();
+    // let placeholder_writer = std::mem::replace(encoder_writer, output);
+    // use std::io::Write;
+    // let mut encoder = lz4_flex::frame::FrameEncoder::new(output);
+    // encoder.write_all(input)?;
+    // encoder
+    //     .finish()
+    //     .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+
     use std::io::Write;
-    let mut encoder = lz4_flex::frame::FrameEncoder::new(output);
-    encoder.write_all(input)?;
-    encoder
-        .finish()
-        .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+    context.lz4_encoder.write_all(input)?;
+    context
+        .lz4_encoder
+        .try_finish()
+        .expect("Can I expect here?"); // TODO can expect
+    let encoder_writer = context.lz4_encoder.get_ref();
+    output.extend_from_slice(&encoder_writer);
     Ok(())
 }
 
 #[cfg(not(feature = "lz4"))]
 #[allow(clippy::ptr_arg)]
-fn compress_lz4(_input: &[u8], _output: &mut Vec<u8>) -> Result<(), ArrowError> {
+fn compress_lz4(
+    _input: &[u8],
+    _output: &mut Vec<u8>,
+    _context: &mut CompressionContext,
+) -> Result<(), ArrowError> {
     Err(ArrowError::InvalidArgumentError(
         "lz4 IPC compression requires the lz4 feature".to_string(),
     ))
@@ -221,7 +247,7 @@ fn compress_zstd(
     output: &mut Vec<u8>,
     context: &mut CompressionContext,
 ) -> Result<(), ArrowError> {
-    let result = context.compressor.compress(input)?;
+    let result = context.zstd_compressor.compress(input)?;
     output.extend_from_slice(&result);
     Ok(())
 }
