@@ -44,6 +44,7 @@ use arrow_schema::*;
 
 use crate::compression::CompressionCodec;
 use crate::gen::Message::{self};
+use crate::compression::CompressionContext;
 use crate::{Block, FieldNode, MetadataVersion, CONTINUATION_MARKER};
 use DataType::*;
 
@@ -60,13 +61,14 @@ fn read_buffer(
     buf: &crate::Buffer,
     a_data: &Buffer,
     compression_codec: Option<CompressionCodec>,
+    compression_context: &mut CompressionContext,
 ) -> Result<Buffer, ArrowError> {
     let start_offset = buf.offset() as usize;
     let buf_data = a_data.slice_with_length(start_offset, buf.length() as usize);
     // corner case: empty buffer
     match (buf_data.is_empty(), compression_codec) {
         (true, _) | (_, None) => Ok(buf_data),
-        (false, Some(decompressor)) => decompressor.decompress_to_buffer(&buf_data),
+        (false, Some(decompressor)) => decompressor.decompress_to_buffer(&buf_data, compression_context),
     }
 }
 impl RecordBatchDecoder<'_> {
@@ -428,6 +430,8 @@ pub struct RecordBatchDecoder<'a> {
     ///
     /// See [`FileDecoder::with_skip_validation`] for details.
     skip_validation: UnsafeFlag,
+
+    compression_context: &'a mut CompressionContext,
 }
 
 impl<'a> RecordBatchDecoder<'a> {
@@ -438,6 +442,7 @@ impl<'a> RecordBatchDecoder<'a> {
         schema: SchemaRef,
         dictionaries_by_id: &'a HashMap<i64, ArrayRef>,
         metadata: &'a MetadataVersion,
+        compression_context: &'a mut CompressionContext,
     ) -> Result<Self, ArrowError> {
         let buffers = batch.buffers().ok_or_else(|| {
             ArrowError::IpcError("Unable to get buffers from IPC RecordBatch".to_string())
@@ -463,6 +468,7 @@ impl<'a> RecordBatchDecoder<'a> {
             projection: None,
             require_alignment: false,
             skip_validation: UnsafeFlag::new(),
+            compression_context,
         })
     }
 
@@ -569,7 +575,7 @@ impl<'a> RecordBatchDecoder<'a> {
     }
 
     fn next_buffer(&mut self) -> Result<Buffer, ArrowError> {
-        read_buffer(self.buffers.next().unwrap(), self.data, self.compression)
+        read_buffer(self.buffers.next().unwrap(), self.data, self.compression, &mut self.compression_context)
     }
 
     fn skip_buffer(&mut self) {
@@ -677,8 +683,10 @@ pub fn read_record_batch(
     dictionaries_by_id: &HashMap<i64, ArrayRef>,
     projection: Option<&[usize]>,
     metadata: &MetadataVersion,
+    // TODO fix how this is a breaking change
+    compression_context: &mut CompressionContext
 ) -> Result<RecordBatch, ArrowError> {
-    RecordBatchDecoder::try_new(buf, batch, schema, dictionaries_by_id, metadata)?
+    RecordBatchDecoder::try_new(buf, batch, schema, dictionaries_by_id, metadata, compression_context)?
         .with_projection(projection)
         .with_require_alignment(false)
         .read_record_batch()
@@ -692,6 +700,8 @@ pub fn read_dictionary(
     schema: &Schema,
     dictionaries_by_id: &mut HashMap<i64, ArrayRef>,
     metadata: &MetadataVersion,
+    // TODO fix how this is a breaking change
+    compression_context: &mut CompressionContext
 ) -> Result<(), ArrowError> {
     read_dictionary_impl(
         buf,
@@ -701,6 +711,7 @@ pub fn read_dictionary(
         metadata,
         false,
         UnsafeFlag::new(),
+        compression_context
     )
 }
 
@@ -712,6 +723,7 @@ fn read_dictionary_impl(
     metadata: &MetadataVersion,
     require_alignment: bool,
     skip_validation: UnsafeFlag,
+    compression_context: &mut CompressionContext,
 ) -> Result<(), ArrowError> {
     let id = batch.id();
 
@@ -723,6 +735,7 @@ fn read_dictionary_impl(
         metadata,
         require_alignment,
         skip_validation,
+        compression_context,
     )?;
 
     update_dictionaries(dictionaries_by_id, batch.isDelta(), id, dictionary_values)?;
@@ -778,6 +791,7 @@ fn get_dictionary_values(
     metadata: &MetadataVersion,
     require_alignment: bool,
     skip_validation: UnsafeFlag,
+    compression_context: &mut CompressionContext
 ) -> Result<ArrayRef, ArrowError> {
     let id = batch.id();
     #[allow(deprecated)]
@@ -801,6 +815,7 @@ fn get_dictionary_values(
                 Arc::new(schema),
                 dictionaries_by_id,
                 metadata,
+                compression_context
             )?
             .with_require_alignment(require_alignment)
             .with_skip_validation(skip_validation)
@@ -996,7 +1011,7 @@ impl FileDecoder {
     }
 
     /// Read the dictionary with the given block and data buffer
-    pub fn read_dictionary(&mut self, block: &Block, buf: &Buffer) -> Result<(), ArrowError> {
+    pub fn read_dictionary(&mut self, block: &Block, buf: &Buffer, compression_context: &mut CompressionContext) -> Result<(), ArrowError> {
         let message = self.read_message(buf)?;
         match message.header_type() {
             crate::MessageHeader::DictionaryBatch => {
@@ -1009,6 +1024,7 @@ impl FileDecoder {
                     &message.version(),
                     self.require_alignment,
                     self.skip_validation.clone(),
+                    compression_context,
                 )
             }
             t => Err(ArrowError::ParseError(format!(
@@ -1022,6 +1038,7 @@ impl FileDecoder {
         &self,
         block: &Block,
         buf: &Buffer,
+        compression_context: &mut CompressionContext,
     ) -> Result<Option<RecordBatch>, ArrowError> {
         let message = self.read_message(buf)?;
         match message.header_type() {
@@ -1039,6 +1056,7 @@ impl FileDecoder {
                     self.schema.clone(),
                     &self.dictionaries,
                     &message.version(),
+                    compression_context,
                 )?
                 .with_projection(self.projection.as_deref())
                 .with_require_alignment(self.require_alignment)
@@ -1177,11 +1195,12 @@ impl FileReaderBuilder {
             decoder = decoder.with_projection(projection)
         }
 
+        let mut compression_context = CompressionContext::default();
         // Create an array of optional dictionary value arrays, one per field.
         if let Some(dictionaries) = footer.dictionaries() {
             for block in dictionaries {
                 let buf = read_block(&mut reader, block)?;
-                decoder.read_dictionary(block, &buf)?;
+                decoder.read_dictionary(block, &buf, &mut compression_context)?;
             }
         }
 
@@ -1192,6 +1211,7 @@ impl FileReaderBuilder {
             total_blocks,
             decoder,
             custom_metadata,
+            compression_context,
         })
     }
 }
@@ -1260,6 +1280,8 @@ pub struct FileReader<R> {
 
     /// User defined metadata
     custom_metadata: HashMap<String, String>,
+
+    compression_context: CompressionContext,
 }
 
 impl<R> fmt::Debug for FileReader<R> {
@@ -1337,7 +1359,7 @@ impl<R: Read + Seek> FileReader<R> {
 
         // read length
         let buffer = read_block(&mut self.reader, block)?;
-        self.decoder.read_record_batch(block, &buffer)
+        self.decoder.read_record_batch(block, &buffer, &mut self.compression_context)
     }
 
     /// Gets a reference to the underlying reader.
@@ -1441,6 +1463,8 @@ pub struct StreamReader<R> {
     ///
     /// See [`FileDecoder::with_skip_validation`] for details.
     skip_validation: UnsafeFlag,
+
+    compression_context: CompressionContext,
 }
 
 impl<R> fmt::Debug for StreamReader<R> {
@@ -1518,6 +1542,7 @@ impl<R: Read> StreamReader<R> {
             dictionaries_by_id,
             projection,
             skip_validation: UnsafeFlag::new(),
+            compression_context: Default::default(),
         })
     }
 
@@ -1605,6 +1630,7 @@ impl<R: Read> StreamReader<R> {
                     schema,
                     &self.dictionaries_by_id,
                     &version,
+                    &mut self.compression_context,
                 )?
                 .with_projection(self.projection.as_ref().map(|x| x.0.as_ref()))
                 .with_require_alignment(false)
@@ -1628,6 +1654,7 @@ impl<R: Read> StreamReader<R> {
                     &version,
                     false,
                     self.skip_validation.clone(),
+                    &mut self.compression_context,
                 )?;
 
                 update_dictionaries(
@@ -2163,7 +2190,7 @@ mod tests {
         for block in footer.dictionaries().iter().flatten() {
             let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
             let data = buffer.slice_with_length(block.offset() as _, block_len);
-            decoder.read_dictionary(block, &data)?
+            decoder.read_dictionary(block, &data, &mut Default::default())?
         }
 
         // Read record batch
@@ -2173,7 +2200,7 @@ mod tests {
         let block = batches.get(0);
         let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
         let data = buffer.slice_with_length(block.offset() as _, block_len);
-        Ok(decoder.read_record_batch(block, &data)?.unwrap())
+        Ok(decoder.read_record_batch(block, &data, &mut Default::default())?.unwrap())
     }
 
     /// Write the record batch to an in-memory buffer in IPC Stream format
@@ -2726,6 +2753,7 @@ mod tests {
             batch.schema(),
             &Default::default(),
             &message.version(),
+            &mut Default::default(),
         )
         .unwrap()
         .with_require_alignment(false)
@@ -2769,6 +2797,7 @@ mod tests {
             batch.schema(),
             &Default::default(),
             &message.version(),
+            &mut Default::default(),
         )
         .unwrap()
         .with_require_alignment(true)

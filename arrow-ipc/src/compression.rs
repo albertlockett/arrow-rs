@@ -31,8 +31,8 @@ pub struct CompressionContext {
     #[cfg(feature = "zstd")]
     zstd_compressor: zstd::bulk::Compressor<'static>,
 
-    #[cfg(feature = "lz4")]
-    lz4_encoder: lz4_flex::frame::FrameEncoder<Vec<u8>>,
+    #[cfg(feature = "zstd")]
+    zstd_decompressor: zstd::bulk::Decompressor<'static>,
 }
 
 // the reason we allow derivable_impls here is because when zstd feature is not enabled, this
@@ -46,10 +46,9 @@ impl Default for CompressionContext {
             zstd_compressor: zstd::bulk::Compressor::new(zstd::DEFAULT_COMPRESSION_LEVEL)
                 .expect("can use default compression level"),
 
-            // note: this vec is a placeholder, we'll switch this with the output vec when calling
-            // [`compress_lz4`]
-            #[cfg(feature = "lz4")]
-            lz4_encoder: lz4_flex::frame::FrameEncoder::new(Vec::new()),
+            #[cfg(feature = "zstd")]
+            // safety: `new` here is actually infallible
+            zstd_decompressor: zstd::bulk::Decompressor::new().expect("can create new Decompressor")
         }
     }
 }
@@ -133,7 +132,7 @@ impl CompressionCodec {
     /// [8 bytes]:         uncompressed length
     /// [remaining bytes]: compressed data stream
     /// ```
-    pub(crate) fn decompress_to_buffer(&self, input: &Buffer) -> Result<Buffer, ArrowError> {
+    pub(crate) fn decompress_to_buffer(&self, input: &Buffer, context: &mut CompressionContext) -> Result<Buffer, ArrowError> {
         // read the first 8 bytes to determine if the data is
         // compressed
         let decompressed_length = read_uncompressed_size(input);
@@ -146,7 +145,7 @@ impl CompressionCodec {
         } else if let Ok(decompressed_length) = usize::try_from(decompressed_length) {
             // decompress data using the codec
             let input_data = &input[(LENGTH_OF_PREFIX_DATA as usize)..];
-            let v = self.decompress(input_data, decompressed_length as _)?;
+            let v = self.decompress(input_data, decompressed_length as _, context)?;
             Buffer::from_vec(v)
         } else {
             return Err(ArrowError::IpcError(format!(
@@ -165,17 +164,22 @@ impl CompressionCodec {
         context: &mut CompressionContext,
     ) -> Result<(), ArrowError> {
         match self {
-            CompressionCodec::Lz4Frame => compress_lz4(input, output, context),
+            CompressionCodec::Lz4Frame => compress_lz4(input, output),
             CompressionCodec::Zstd => compress_zstd(input, output, context),
         }
     }
 
     /// Decompress the data in input buffer and write to output buffer
     /// using the specified compression
-    fn decompress(&self, input: &[u8], decompressed_size: usize) -> Result<Vec<u8>, ArrowError> {
+    fn decompress(
+        &self, 
+        input: &[u8], 
+        decompressed_size: usize,
+        context: &mut CompressionContext,
+    ) -> Result<Vec<u8>, ArrowError> {
         let ret = match self {
             CompressionCodec::Lz4Frame => decompress_lz4(input, decompressed_size)?,
-            CompressionCodec::Zstd => decompress_zstd(input, decompressed_size)?,
+            CompressionCodec::Zstd => decompress_zstd(input, decompressed_size, context)?,
         };
         if ret.len() != decompressed_size {
             return Err(ArrowError::IpcError(format!(
@@ -191,25 +195,14 @@ impl CompressionCodec {
 fn compress_lz4(
     input: &[u8],
     output: &mut Vec<u8>,
-    context: &mut CompressionContext,
 ) -> Result<(), ArrowError> {
-    // let encoder_writer = context.lz4_encoder.get_mut();
-    // let placeholder_writer = std::mem::replace(encoder_writer, output);
-    // use std::io::Write;
-    // let mut encoder = lz4_flex::frame::FrameEncoder::new(output);
-    // encoder.write_all(input)?;
-    // encoder
-    //     .finish()
-    //     .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
-
     use std::io::Write;
-    context.lz4_encoder.write_all(input)?;
-    context
-        .lz4_encoder
-        .try_finish()
-        .expect("Can I expect here?"); // TODO can expect
-    let encoder_writer = context.lz4_encoder.get_ref();
-    output.extend_from_slice(&encoder_writer);
+    let mut encoder = lz4_flex::frame::FrameEncoder::new(output);
+    encoder.write_all(input)?;
+    encoder
+        .finish()
+        .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+
     Ok(())
 }
 
@@ -218,7 +211,6 @@ fn compress_lz4(
 fn compress_lz4(
     _input: &[u8],
     _output: &mut Vec<u8>,
-    _context: &mut CompressionContext,
 ) -> Result<(), ArrowError> {
     Err(ArrowError::InvalidArgumentError(
         "lz4 IPC compression requires the lz4 feature".to_string(),
@@ -265,16 +257,14 @@ fn compress_zstd(
 }
 
 #[cfg(feature = "zstd")]
-fn decompress_zstd(input: &[u8], decompressed_size: usize) -> Result<Vec<u8>, ArrowError> {
-    use std::io::Read;
-    let mut output = Vec::with_capacity(decompressed_size);
-    zstd::Decoder::with_buffer(input)?.read_to_end(&mut output)?;
+fn decompress_zstd(input: &[u8], decompressed_size: usize, context: &mut CompressionContext) -> Result<Vec<u8>, ArrowError> {
+    let output = context.zstd_decompressor.decompress(input, decompressed_size)?;
     Ok(output)
 }
 
 #[cfg(not(feature = "zstd"))]
 #[allow(clippy::ptr_arg)]
-fn decompress_zstd(_input: &[u8], _decompressed_size: usize) -> Result<Vec<u8>, ArrowError> {
+fn decompress_zstd(_input: &[u8], _decompressed_size: usize, _context: &mut CompressionContext) -> Result<Vec<u8>, ArrowError> {
     Err(ArrowError::InvalidArgumentError(
         "zstd IPC decompression requires the zstd feature".to_string(),
     ))
@@ -304,7 +294,7 @@ mod tests {
             .compress(input_bytes, &mut output_bytes, &mut Default::default())
             .unwrap();
         let result = codec
-            .decompress(output_bytes.as_slice(), input_bytes.len())
+            .decompress(output_bytes.as_slice(), input_bytes.len(), &mut Default::default())
             .unwrap();
         assert_eq!(input_bytes, result.as_slice());
     }
@@ -319,7 +309,7 @@ mod tests {
             .compress(input_bytes, &mut output_bytes, &mut Default::default())
             .unwrap();
         let result = codec
-            .decompress(output_bytes.as_slice(), input_bytes.len())
+            .decompress(output_bytes.as_slice(), input_bytes.len(), &mut Default::default())
             .unwrap();
         assert_eq!(input_bytes, result.as_slice());
     }

@@ -42,7 +42,7 @@ use arrow_data::{layout, ArrayData, ArrayDataBuilder, BufferSpec};
 use arrow_schema::*;
 
 use crate::compression::CompressionCodec;
-pub use crate::compression::CompressionContext;
+use crate::compression::CompressionContext;
 use crate::convert::IpcSchemaEncoder;
 use crate::CONTINUATION_MARKER;
 
@@ -3174,7 +3174,7 @@ mod tests {
             let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
             let data = buffer.slice_with_length(block.offset() as _, block_len);
 
-            let batch2 = decoder.read_record_batch(block, &data).unwrap().unwrap();
+            let batch2 = decoder.read_record_batch(block, &data, &mut Default::default()).unwrap().unwrap();
 
             assert_eq!(batch, batch2);
         }
@@ -3226,7 +3226,7 @@ mod tests {
         let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
         let data = buffer.slice_with_length(block.offset() as _, block_len);
 
-        let result = decoder.read_record_batch(block, &data);
+        let result = decoder.read_record_batch(block, &data, &mut Default::default());
 
         let error = result.unwrap_err();
         assert_eq!(

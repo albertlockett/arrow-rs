@@ -26,6 +26,7 @@ use arrow_schema::{ArrowError, SchemaRef};
 
 use crate::convert::MessageBuffer;
 use crate::reader::{read_dictionary_impl, RecordBatchDecoder};
+use crate::compression::CompressionContext;
 use crate::{MessageHeader, CONTINUATION_MARKER};
 
 /// A low-level interface for reading [`RecordBatch`] data from a stream of bytes
@@ -208,6 +209,7 @@ impl StreamDecoder {
                     };
 
                     let version = message.version();
+                    let mut compression_ctx = CompressionContext::default();
                     match message.header_type() {
                         MessageHeader::Schema => {
                             if self.schema.is_some() {
@@ -232,6 +234,7 @@ impl StreamDecoder {
                                 schema,
                                 &self.dictionaries,
                                 &version,
+                                &mut compression_ctx,
                             )?
                             .with_require_alignment(self.require_alignment)
                             .read_record_batch()?;
@@ -251,6 +254,7 @@ impl StreamDecoder {
                                 &version,
                                 self.require_alignment,
                                 self.skip_validation.clone(),
+                                &mut compression_ctx,
                             )?;
                             self.state = DecoderState::default();
                         }

@@ -18,6 +18,7 @@
 use arrow_array::builder::{Date32Builder, Decimal128Builder, Int32Builder};
 use arrow_array::{builder::StringBuilder, RecordBatch};
 use arrow_buffer::Buffer;
+use arrow_ipc::CompressionContext;
 use arrow_ipc::convert::fb_to_schema;
 use arrow_ipc::reader::{read_footer_length, FileDecoder, FileReader, StreamReader};
 use arrow_ipc::writer::{FileWriter, IpcWriteOptions, StreamWriter};
@@ -142,7 +143,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             // Convert the mmap region to an Arrow `Buffer` to back the arrow arrays.
             let bytes = bytes::Bytes::from_owner(mmap);
             let buffer = Buffer::from(bytes);
-            let decoder = IPCBufferDecoder::new(buffer);
+            let mut decoder = IPCBufferDecoder::new(buffer);
             assert_eq!(decoder.num_batches(), 10);
 
             for i in 0..decoder.num_batches() {
@@ -161,7 +162,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             let bytes = bytes::Bytes::from_owner(mmap);
             let buffer = Buffer::from(bytes);
             let decoder = IPCBufferDecoder::new(buffer);
-            let decoder = unsafe { decoder.with_skip_validation(true) };
+            let mut decoder = unsafe { decoder.with_skip_validation(true) };
             assert_eq!(decoder.num_batches(), 10);
 
             for i in 0..decoder.num_batches() {
@@ -207,6 +208,8 @@ struct IPCBufferDecoder {
     decoder: FileDecoder,
     /// Location of the batches within the buffer
     batches: Vec<Block>,
+    /// Context used when reading compressed data
+    compression_context: CompressionContext
 }
 
 impl IPCBufferDecoder {
@@ -218,12 +221,12 @@ impl IPCBufferDecoder {
         let schema = fb_to_schema(footer.schema().unwrap());
 
         let mut decoder = FileDecoder::new(Arc::new(schema), footer.version());
-
+        let mut compression_context = CompressionContext::default();
         // Read dictionaries
         for block in footer.dictionaries().iter().flatten() {
             let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
             let data = buffer.slice_with_length(block.offset() as _, block_len);
-            decoder.read_dictionary(block, &data).unwrap();
+            decoder.read_dictionary(block, &data, &mut compression_context).unwrap();
         }
 
         // convert to Vec from the flatbuffers Vector to avoid having a direct dependency on flatbuffers
@@ -236,6 +239,7 @@ impl IPCBufferDecoder {
             buffer,
             decoder,
             batches,
+            compression_context,
         }
     }
 
@@ -248,14 +252,14 @@ impl IPCBufferDecoder {
         self.batches.len()
     }
 
-    fn get_batch(&self, i: usize) -> RecordBatch {
+    fn get_batch(&mut self, i: usize) -> RecordBatch {
         let block = &self.batches[i];
         let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
         let data = self
             .buffer
             .slice_with_length(block.offset() as _, block_len);
         self.decoder
-            .read_record_batch(block, &data)
+            .read_record_batch(block, &data, &mut self.compression_context)
             .unwrap()
             .unwrap()
     }

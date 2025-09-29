@@ -49,6 +49,7 @@ pub mod reader;
 pub mod writer;
 
 mod compression;
+pub use self::compression::CompressionContext;
 
 #[cfg(test)]
 mod tests;
